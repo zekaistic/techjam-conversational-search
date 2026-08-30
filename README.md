@@ -1,11 +1,12 @@
-# TechJam Conversational Product Search
+# Team TokTik's Shopping Copilot
 
 ## Project overview
 
-This project is a deterministic, offline shopping agent built for the TechJam
-Conversational E-Commerce Search Challenge. It searches a frozen catalog of
-50,000 Amazon products and tries to identify the customer's target product as
-early and as highly ranked as possible within a ten-turn conversation.
+Our Shopping Copilot is a deterministic, offline shopping agent built
+for the TechJam Conversational E-Commerce Search Challenge. It searches a
+frozen catalog of 50,000 Amazon products and tries to identify the customer's
+target product as early and as highly ranked as possible within a ten-turn
+conversation.
 
 On each turn, the agent:
 
