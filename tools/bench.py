@@ -23,8 +23,10 @@ import collections
 import itertools
 import json
 import os
+import statistics
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
@@ -53,13 +55,80 @@ def technical_score(hit_rate: float, mrr: float, mttc: float) -> tuple[float, fl
     return 0.50 * hit_rate + 0.30 * mrr + 0.20 * efficiency, efficiency
 
 
+# ---------------------------------------------------------------- latency ---
+
+class TimedAgent:
+    """Wall-clock proxy around the real Agent.
+
+    The submission rules require a latency disclosure, and the evaluator is
+    off-limits -- so time the calls from outside instead of instrumenting the
+    scored loop. Every attribute that is not `reset`/`respond` falls through,
+    so the evaluator cannot tell the difference.
+    """
+
+    def __init__(self, agent) -> None:
+        self._agent = agent
+        self.turn_ms: list[float] = []
+        self.reset_ms: list[float] = []
+
+    def reset(self, session_id: str, user_profile: dict) -> None:
+        started = time.perf_counter()
+        self._agent.reset(session_id, user_profile)
+        self.reset_ms.append((time.perf_counter() - started) * 1000.0)
+
+    def respond(self, session_id: str, user_message: str, turn: int, top_k: int) -> dict:
+        started = time.perf_counter()
+        response = self._agent.respond(session_id, user_message, turn, top_k)
+        self.turn_ms.append((time.perf_counter() - started) * 1000.0)
+        return response
+
+    def __getattr__(self, name):
+        return getattr(self._agent, name)
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    """Nearest-rank percentile. No numpy dependency in the scored path."""
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, int(round(fraction * len(ordered) + 0.5)) - 1))
+    return ordered[index]
+
+
+def latency_summary(turn_ms: list[float], load_seconds: float) -> dict:
+    if not turn_ms:
+        return {}
+    # The first turn of the whole run pays a one-off index warm-up that no
+    # later turn repeats. Report it separately rather than letting one outlier
+    # distort the steady-state percentiles.
+    cold = turn_ms[0]
+    warm = turn_ms[1:] or turn_ms
+    return {
+        "turns_measured": len(turn_ms),
+        "cold_start_load_seconds": round(load_seconds, 3),
+        "first_turn_ms": round(cold, 2),
+        "mean_ms": round(statistics.fmean(warm), 2),
+        "p50_ms": round(_percentile(warm, 0.50), 2),
+        "p95_ms": round(_percentile(warm, 0.95), 2),
+        "p99_ms": round(_percentile(warm, 0.99), 2),
+        "max_ms": round(max(warm), 2),
+        "total_seconds": round(sum(turn_ms) / 1000.0, 2),
+    }
+
+
 # ------------------------------------------------------------------- runs ---
 
 def run(catalog: str, dataset: str, output: Optional[str] = None) -> dict:
     """The scored path: the real evaluator, untouched."""
     samples = load_jsonl(dataset)
     catalog_ids, categories, products = catalog_index(catalog)
-    result = evaluate(Agent(catalog), samples, catalog_ids, categories, products)
+    started = time.perf_counter()
+    agent = TimedAgent(Agent(catalog))
+    load_seconds = time.perf_counter() - started
+    result = evaluate(agent, samples, catalog_ids, categories, products)
+    latency = latency_summary(agent.turn_ms, load_seconds)
+    if latency:
+        result["latency_ms"] = latency
     if output:
         Path(output).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
     return result
@@ -221,6 +290,7 @@ def report(result: dict, sessions: Optional[list[dict]] = None) -> None:
     if sessions:
         _histogram(sessions)
         _rank_profile(sessions)
+    _latency_report(result.get("latency_ms"))
     usage = result.get("reported_token_usage", {})
     print(f"\n  tokens          {usage.get('total_tokens', 0)}")
 
@@ -243,6 +313,18 @@ def _histogram(sessions: list[dict]) -> None:
     if not dead and misses:
         print(f"    -> turns 5-{MAX_TURNS} produced ZERO hits: {misses} misses are "
               f"already permanent by turn 4.")
+
+
+def _latency_report(latency: Optional[dict]) -> None:
+    """The feasibility disclosure the submission rules ask for."""
+    if not latency:
+        return
+    print(f"\n  latency per turn    ({latency['turns_measured']} turns measured, "
+          f"cold start {latency['cold_start_load_seconds']:.1f}s)")
+    print(f"    p50 {latency['p50_ms']:8.1f} ms      mean {latency['mean_ms']:8.1f} ms")
+    print(f"    p95 {latency['p95_ms']:8.1f} ms      p99  {latency['p99_ms']:8.1f} ms")
+    print(f"    max {latency['max_ms']:8.1f} ms      first turn (index warm-up) "
+          f"{latency['first_turn_ms']:.1f} ms")
 
 
 def _rank_profile(sessions: list[dict]) -> None:
